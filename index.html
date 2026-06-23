@@ -221,6 +221,7 @@ var ST = {
   cfg_CMQ: {zones:{}, rects:[], sched:{}, mapImg:null, cfg:{green:85,yellow:60,forums:["Reunion CMQ","Daily operativo","Reunion 5S mensual","Reunion de equipo"]}},
   cfg_OL:  {zones:{}, rects:[], sched:{}, mapImg:null, cfg:{green:85,yellow:60,forums:["Reunion OL","Daily OL"]}},
   acts: {},
+  zonePhotos: {}, // keyed "TEAM|zona" -> base64 photo, loaded from s5_zone_photos table
   mapUndo: [],
   editMap: false,
   drawing: false,
@@ -246,6 +247,7 @@ function setSS(ok,msg){
 async function loadFromSupa(){
   try {
     var r1=await sbFetch("s5_config?id=eq.main&select=*");
+    var needsMigration=false;
     if(r1.ok){
       var d=await r1.json();
       if(d&&d[0]){
@@ -260,8 +262,21 @@ async function loadFromSupa(){
         if(c.sched_ol)  ST.cfg_OL.sched=c.sched_ol;
         if(c.cfg_ol)    ST.cfg_OL.cfg=Object.assign(ST.cfg_OL.cfg,c.cfg_ol);
         if(c.map_img_ol)ST.cfg_OL.mapImg=c.map_img_ol;
+        // Detect old-style embedded photos that still need migrating out
+        Object.keys(ST.cfg_CMQ.zones||{}).forEach(function(k){if(ST.cfg_CMQ.zones[k]&&ST.cfg_CMQ.zones[k].photo)needsMigration=true;});
+        Object.keys(ST.cfg_OL.zones||{}).forEach(function(k){if(ST.cfg_OL.zones[k]&&ST.cfg_OL.zones[k].photo)needsMigration=true;});
       }
     }
+    // Load zone photos from the dedicated table (does not bloat config payloads)
+    var rp=await sbFetch("s5_zone_photos?select=*");
+    if(rp.ok){
+      var photos=await rp.json();
+      ST.zonePhotos={};
+      if(photos&&photos.length){
+        photos.forEach(function(p){ST.zonePhotos[p.team+"|"+p.zona]=p.photo;});
+      }
+    }
+    if(needsMigration)await migrateOldPhotos();
     var r2=await sbFetch("s5_records?select=*&order=mes.asc");
     if(r2.ok){
       var ex=await r2.json();
@@ -295,10 +310,36 @@ async function loadFromSupa(){
   go(ST.view);
 }
 
+async function migrateOldPhotos(){
+  // One-time migration: move any photo still embedded in zones/zones_ol
+  // into the dedicated s5_zone_photos table, then strip them from config.
+  try {
+    var moved=0;
+    var jobs=[];
+    Object.keys(ST.cfg_CMQ.zones||{}).forEach(function(k){
+      var z=ST.cfg_CMQ.zones[k];
+      if(z&&z.photo){
+        ST.zonePhotos["CMQ|"+k]=z.photo;
+        jobs.push(sbFetch("s5_zone_photos",{method:"POST",body:JSON.stringify({zona:k,team:"CMQ",photo:z.photo}),xh:{"Prefer":"resolution=merge-duplicates,return=minimal"}}));
+        delete z.photo;
+        moved++;
+      }
+    });
+    Object.keys(ST.cfg_OL.zones||{}).forEach(function(k){
+      var z=ST.cfg_OL.zones[k];
+      if(z&&z.photo){
+        ST.zonePhotos["OL|"+k]=z.photo;
+        jobs.push(sbFetch("s5_zone_photos",{method:"POST",body:JSON.stringify({zona:k,team:"OL",photo:z.photo}),xh:{"Prefer":"resolution=merge-duplicates,return=minimal"}}));
+        delete z.photo;
+        moved++;
+      }
+    });
+    await Promise.all(jobs);
+    if(moved>0)await saveConfig(); // now safe - photos already stripped, payload is light
+  } catch(e){ /* migration failure is non-fatal; will retry next load */ }
+}
 async function saveConfig(){
   if(IS_VIEWER)return;
-  // Lightweight payload: zones/rects/sched/cfg only - NEVER includes map images,
-  // so deleting/editing a zone can't fail due to image payload size.
   var payload={
     id:"main",
     zones:ST.cfg_CMQ.zones, rects:ST.cfg_CMQ.rects, sched:ST.cfg_CMQ.sched,
@@ -923,13 +964,13 @@ function rZonas(){
   var filtered=zz.filter(function(z){if(selOwner==="(Todos)")return true;return(tc().zones[z]?tc().zones[z].owner||"":"")===selOwner;});
   filtered.sort(function(a,b){var oa=(tc().zones[a]?tc().zones[a].owner||"":"").toLowerCase(),ob=(tc().zones[b]?tc().zones[b].owner||"":"").toLowerCase();return oa!==ob?oa<ob?-1:1:a<b?-1:1;});
   filtered.forEach(function(z){
-    var score=zoneAvgScore(z),cfg=tc().zones[z]||{};
+    var score=zoneAvgScore(z),cfg=tc().zones[z]||{},zphoto=ST.zonePhotos[ST.team+"|"+z];
     var b=SL.map(function(_,si){return zoneAvgByS(z,si);});
     var valids=b.filter(function(v){return v!==null;});
     var wkI=valids.length?b.findIndex(function(v){return v===Math.min.apply(null,valids);}):- 1;
     h+="<div class='zcard' data-z='"+esc(z)+"' style='border-left:3px solid "+sem(score)+"'>";
     h+="<div style='display:flex;align-items:center;gap:10px;margin-bottom:9px'>";
-    if(cfg.photo)h+="<img src='"+cfg.photo+"' style='width:46px;height:46px;border-radius:50%;object-fit:cover;border:2px solid "+sem(score)+"'>";
+    if(zphoto)h+="<img src='"+zphoto+"' style='width:46px;height:46px;border-radius:50%;object-fit:cover;border:2px solid "+sem(score)+"'>";
     else h+="<div style='width:46px;height:46px;border-radius:50%;background:#22263a;display:flex;align-items:center;justify-content:center;font-size:18px;border:2px solid "+sem(score)+"'>🏭</div>";
     h+="<div style='flex:1;overflow:hidden'>";
     h+="<div style='font-weight:700;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>"+z+"</div>";
@@ -967,8 +1008,9 @@ function addZoneM(){
 function openZone(z){
   var recs=zRecs(z).sort(function(a,b){return a.mes-b.mes;});
   var ms=activeMonths();
-  if(!tc().zones[z])tc().zones[z]={owner:"",photo:"",color:"#3b82f6"};
+  if(!tc().zones[z])tc().zones[z]={owner:"",color:"#3b82f6"};
   var cfg=tc().zones[z];
+  var zphoto=ST.zonePhotos[ST.team+"|"+z];
   var b=SL.map(function(_,si){return zoneAvgByS(z,si);});
   var ts=zoneAvgScore(z);
   var lbl=periodLabel();
@@ -985,7 +1027,7 @@ function openZone(z){
   h+="<div style='display:flex;align-items:center;gap:12px;margin-bottom:16px'>";
   if(!IS_VIEWER){
     h+="<div id='ph-wrap' onclick='document.getElementById(\"ph-inp\").click()' style='cursor:pointer;position:relative;flex-shrink:0'>";
-    if(cfg.photo)h+="<img src='"+cfg.photo+"' style='width:64px;height:64px;border-radius:50%;object-fit:cover;border:2px solid "+sem(ts)+"'>";
+    if(zphoto)h+="<img src='"+zphoto+"' style='width:64px;height:64px;border-radius:50%;object-fit:cover;border:2px solid "+sem(ts)+"'>";
     else h+="<div style='width:64px;height:64px;border-radius:50%;background:#22263a;display:flex;align-items:center;justify-content:center;font-size:22px;border:2px solid "+sem(ts)+"'>🏭</div>";
     h+="<div style='position:absolute;bottom:0;right:0;background:#3b82f6;border-radius:50%;width:17px;height:17px;display:flex;align-items:center;justify-content:center;font-size:9px'>✏</div></div>";
     h+="<input type='file' id='ph-inp' accept='image/*' style='display:none' onchange='doPhoto(\""+esc(z)+"\")'>";
@@ -996,7 +1038,7 @@ function openZone(z){
     h+="<div style='display:flex;align-items:center;gap:7px;margin-top:5px'><input type='color' value='"+(cfg.color||"#3b82f6")+"' onchange='updZoneColor(\""+escJ(z)+"\",this.value)' style='width:20px;height:20px;border:none;cursor:pointer;border-radius:50%'><span style='font-size:10px;color:#64748b'>Color mapa</span></div>";
     h+="</div>";
   } else {
-    if(cfg.photo)h+="<img src='"+cfg.photo+"' style='width:64px;height:64px;border-radius:50%;object-fit:cover;border:2px solid "+sem(ts)+"'>";
+    if(zphoto)h+="<img src='"+zphoto+"' style='width:64px;height:64px;border-radius:50%;object-fit:cover;border:2px solid "+sem(ts)+"'>";
     else h+="<div style='width:64px;height:64px;border-radius:50%;background:#22263a;display:flex;align-items:center;justify-content:center;font-size:22px;border:2px solid "+sem(ts)+"'>🏭</div>";
     h+="<div style='flex:1'><div style='font-size:15px;font-weight:700'>"+(cfg.owner||"Sin dueño")+"</div><div style='font-size:11px;color:#94a3b8;margin-top:2px'>Dueño · "+z+"</div><div style='font-size:10px;color:#64748b;margin-top:2px'>"+lbl+"</div></div>";
   }
@@ -1148,16 +1190,29 @@ function doPhoto(z){
   var img=new Image(),rd=new FileReader();
   rd.onload=function(e){
     img.onload=function(){
-      var cv=document.createElement("canvas"),s=Math.min(1,400/img.width);
+      var cv=document.createElement("canvas"),s=Math.min(1,250/img.width);
       cv.width=img.width*s;cv.height=img.height*s;
       cv.getContext("2d").drawImage(img,0,0,cv.width,cv.height);
-      if(!tc().zones[z])tc().zones[z]={};
-      tc().zones[z].photo=cv.toDataURL("image/jpeg",0.8);
-      saveConfig();
+      var photoData=cv.toDataURL("image/jpeg",0.5);
+      var key=ST.team+"|"+z;
+      ST.zonePhotos[key]=photoData;
+      savePhoto(z,photoData);
       var pw=document.getElementById("ph-wrap");
-      if(pw){var imgs=pw.querySelector("img,div");if(imgs&&imgs.tagName==="IMG")imgs.src=tc().zones[z].photo;}
+      if(pw){var imgs=pw.querySelector("img,div");if(imgs&&imgs.tagName==="IMG")imgs.src=photoData;}
     };img.src=e.target.result;
   };rd.readAsDataURL(f);
+}
+async function savePhoto(z,photoData){
+  // Saves a single zone photo to its own table row - never touches s5_config
+  try {
+    setSS(true,"Guardando foto...");
+    var r=await sbFetch("s5_zone_photos",{method:"POST",body:JSON.stringify({zona:z,team:ST.team,photo:photoData}),xh:{"Prefer":"resolution=merge-duplicates,return=minimal"}});
+    if(!r.ok){throw new Error("HTTP "+r.status);}
+    setSS(true,"Guardado");
+  } catch(e){
+    setSS(false,"Error al guardar foto");
+    alert("⚠ No se pudo guardar la foto de la zona.\n\n"+(e.message||e));
+  }
 }
 
 function zTab(id){
